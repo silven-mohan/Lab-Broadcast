@@ -94,6 +94,7 @@ class Receiver:
     def handle_sse(self, payload):
         try:
             msg = json.loads(payload)
+            log.info("SSE raw: %s", payload[:300])            
             if msg.get("name") != "new_media":
                 return
             data = msg["data"]
