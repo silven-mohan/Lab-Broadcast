@@ -79,9 +79,12 @@ class Receiver:
                     r.raise_for_status()
                     log.info("Connected to Ably channel '%s'", ABLY_CHANNEL)
                     delay = 2
-                    for raw in r.iter_lines(decode_unicode=True):
+                    for raw in r.iter_lines(chunk_size=1, decode_unicode=True):
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", "replace")
                         if raw and raw.startswith("data:"):
                             self.handle_sse(raw[5:].strip())
+                          
                 log.warning("Stream ended; reconnecting")
             except Exception as exc:
                 log.error("Connection error: %s (retry in %ss)", exc, delay)
