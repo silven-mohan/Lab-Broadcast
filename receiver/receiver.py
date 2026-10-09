@@ -1,23 +1,49 @@
 """Media Broadcast receiver (Vercel polling edition).
 
-Polls <BROADCAST_URL>/api/latest every few seconds. When a new broadcast event
-appears, downloads the announced file from Vercel Blob and shows it fullscreen.
-Plain HTTPS only: no Ably, no SDK, no long-lived connections.
+Runs invisibly in the background. Polls <BROADCAST_URL>/api/latest every few seconds.
+When a NEW broadcast appears it downloads the file from Vercel Blob, opens a fullscreen
+window and shows it. The window disappears again when a video ends, when the operator
+presses Esc, or after IMAGE_SECONDS for images (if set). Plain HTTPS only.
+
+Settings come from environment variables or from a local file named receiver.env
+next to this script (KEY=VALUE per line, never committed to git).
 """
 import json
 import logging
 import os
 import queue
+import socket
 import sys
 import threading
 import time
 from urllib.parse import urlparse
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_local_env():
+    """Read receiver.env (if present). Real environment variables win over the file."""
+    try:
+        with open(os.path.join(HERE, "receiver.env"), encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+load_local_env()
+
 # ---------------- Configuration ----------------
-BROADCAST_URL = os.environ.get("BROADCAST_URL", "").rstrip("/")  # e.g. https://your-app.vercel.app
-RECEIVER_KEY = os.environ.get("RECEIVER_KEY", "")                # same value as RECEIVER_KEY on Vercel (optional)
+BROADCAST_URL = os.environ.get("BROADCAST_URL", "").rstrip("/")   # e.g. https://your-app.vercel.app
+RECEIVER_KEY = os.environ.get("RECEIVER_KEY", "")                 # same as RECEIVER_KEY on Vercel (optional)
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "3"))
-SHOW_LAST_ON_START = os.environ.get("SHOW_LAST_ON_START", "0") == "1"  # replay the current event at startup?
+IMAGE_SECONDS = float(os.environ.get("IMAGE_SECONDS", "0"))        # 0 = image stays until Esc or next broadcast
+SHOW_LAST_ON_START = os.environ.get("SHOW_LAST_ON_START", "0") == "1"
+LOCK_PORT = int(os.environ.get("LOCK_PORT", "47653"))             # single-instance guard
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".media_broadcast_cache")
 LOG_FILE = os.path.join(CACHE_DIR, "receiver.log")
 CACHE_MAX_AGE_DAYS = 7
@@ -39,6 +65,22 @@ except Exception:
     raise
 
 
+class AuthError(Exception):
+    pass
+
+
+def acquire_single_instance():
+    """Bind a local port; a second copy of the receiver fails to bind and exits."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", LOCK_PORT))
+    except OSError:
+        s.close()
+        return None
+    s.listen(1)
+    return s
+
+
 def prune_cache():
     cutoff = time.time() - CACHE_MAX_AGE_DAYS * 86400
     for name in os.listdir(CACHE_DIR):
@@ -56,15 +98,16 @@ class Receiver:
         self.root = tk.Tk()
         self.root.title("Media Receiver")
         self.root.configure(bg="black", cursor="none")
-        self.root.attributes("-fullscreen", True)
-        self.root.attributes("-topmost", True)
-        self.root.bind("<Escape>", lambda e: self.quit())  # operator escape hatch
+        self.root.withdraw()                                   # invisible until a broadcast arrives
+        self.root.bind("<Escape>", lambda e: self.close_window())   # operator: dismiss
+        self.root.bind("<Control-Shift-Q>", lambda e: self.quit())  # operator: stop the receiver
 
         self.label = tk.Label(self.root, bg="black")
         self.video_frame = tk.Frame(self.root, bg="black")
-        self.status = tk.Label(self.root, bg="black", fg="#666666", font=("Segoe UI", 14))
-        self._status_job = None
+        self.notice = tk.Label(self.root, bg="black", fg="#cccccc", font=("Segoe UI", 20), wraplength=1000)
         self.photo = None
+        self.visible = False
+        self._hide_job = None
         self.vlc_instance = vlc.Instance("--no-xlib") if sys.platform.startswith("linux") else vlc.Instance()
         self.player = self.vlc_instance.media_player_new()
         em = self.player.event_manager()
@@ -74,28 +117,28 @@ class Receiver:
 
     # ---------- networking (background threads) ----------
     def listen_loop(self):
-        """Poll /api/latest forever; back off on errors."""
+        """Poll /api/latest forever; back off on errors. Never touches the UI directly."""
         if not BROADCAST_URL.startswith("http"):
-            log.error("BROADCAST_URL is missing or invalid (got %r). Edit start.bat.", BROADCAST_URL)
-            self.events.put(("status", ("BROADCAST_URL is not set - edit start.bat", None)))
+            log.error("BROADCAST_URL is missing or invalid (got %r). Edit receiver.env.", BROADCAST_URL)
+            self.events.put(("notice", ("Receiver not configured: BROADCAST_URL is missing.\nEdit receiver.env", 15)))
             return
         url = BROADCAST_URL + "/api/latest"
         params = {"k": RECEIVER_KEY} if RECEIVER_KEY else None
         last_id = None
         first_poll = True
         connected = False
+        auth_notified = False
         delay = POLL_SECONDS
         log.info("Polling %s every %ss", url, POLL_SECONDS)
         while True:
             try:
                 r = requests.get(url, params=params, timeout=(10, 20))
                 if r.status_code == 401:
-                    raise RuntimeError("401 Unauthorized - RECEIVER_KEY does not match the one on Vercel")
+                    raise AuthError("401 Unauthorized - RECEIVER_KEY does not match the one on Vercel")
                 r.raise_for_status()
                 if not connected:
                     connected = True
                     log.info("Connected to %s", url)
-                    self.events.put(("status", ("Ready - waiting for broadcast", 5)))
                 delay = POLL_SECONDS
                 if r.status_code == 200:
                     data = r.json()
@@ -108,11 +151,15 @@ class Receiver:
                             log.info("Event: %s", data)
                             self.handle_event(data)
                 first_poll = False
+            except AuthError as exc:
+                log.error("%s", exc)
+                if not auth_notified:
+                    auth_notified = True
+                    self.events.put(("notice", ("Receiver key rejected by server.\nCheck RECEIVER_KEY in receiver.env", 15)))
+                delay = 30
             except Exception as exc:
+                connected = False
                 log.error("Poll failed: %s (retry in %ss)", exc, delay)
-                if connected or first_poll:
-                    connected = False
-                    self.events.put(("status", (f"Cannot reach server - retrying ({exc})"[:120], None)))
                 delay = min(delay * 2, 30)
             time.sleep(delay)
 
@@ -150,43 +197,65 @@ class Receiver:
                 if kind == "show":
                     latest_show = payload
                 elif kind == "video_end":
-                    self.idle()
-                elif kind == "status":
-                    self.set_status(*payload)
+                    self.close_window()
+                elif kind == "notice":
+                    self.show_notice(*payload)
         except queue.Empty:
             pass
         if latest_show:
             self.show(*latest_show)
         self.root.after(200, self.poll)
 
-    def set_status(self, text, seconds):
-        if self._status_job:
-            self.root.after_cancel(self._status_job)
-            self._status_job = None
-        self.status.configure(text=text)
-        self.status.place(relx=0.5, rely=0.5, anchor="center")
-        if seconds:
-            self._status_job = self.root.after(int(seconds * 1000), self.clear_status)
+    def _cancel_hide(self):
+        if self._hide_job:
+            self.root.after_cancel(self._hide_job)
+            self._hide_job = None
 
-    def clear_status(self):
-        self._status_job = None
-        self.status.place_forget()
-
-    def idle(self):
+    def _clear_content(self):
         self.player.stop()
         self.label.pack_forget()
         self.video_frame.pack_forget()
+        self.notice.place_forget()
+
+    def open_window(self):
+        if not self.visible:
+            self.root.deiconify()
+            self.root.attributes("-fullscreen", True)
+            self.root.attributes("-topmost", True)
+            self.visible = True
+        self.root.lift()
+        self.root.focus_force()
+        self.root.update_idletasks()
+
+    def close_window(self):
+        """Hide the window again; the receiver keeps running in the background."""
+        self._cancel_hide()
+        self._clear_content()
+        self.root.withdraw()
+        self.visible = False
+
+    def show_notice(self, text, seconds):
+        self._cancel_hide()
+        self._clear_content()
+        self.open_window()
+        self.notice.configure(text=text)
+        self.notice.place(relx=0.5, rely=0.5, anchor="center")
+        self._hide_job = self.root.after(int(seconds * 1000), self.close_window)
 
     def show(self, path, media_type):
-        self.idle()
-        self.clear_status()
+        self._cancel_hide()
+        self._clear_content()
+        self.open_window()
         try:
             if media_type == "image":
                 self.show_image(path)
+                if IMAGE_SECONDS > 0:
+                    self._hide_job = self.root.after(int(IMAGE_SECONDS * 1000), self.close_window)
             else:
                 self.show_video(path)
         except Exception as exc:
             log.error("Display failed: %s", exc)
+            self.close_window()
 
     def show_image(self, path):
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -223,6 +292,10 @@ class Receiver:
 
 
 if __name__ == "__main__":
+    lock = acquire_single_instance()
+    if lock is None:
+        log.info("Another receiver is already running; exiting.")
+        sys.exit(0)
     try:
         Receiver().run()
     except Exception:
