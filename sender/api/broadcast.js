@@ -1,7 +1,8 @@
-// Pushes a "new_media" event to every receiver through Ably (real-time, no polling).
+// Announces a new media file to every receiver.
+// Stores the newest event in Redis; receivers poll /api/latest and pick it up within a few seconds.
+import { randomUUID } from 'node:crypto';
 import { checkPassword } from './_auth.js';
-
-const CHANNEL = process.env.ABLY_CHANNEL || 'media';
+import { redis, LATEST_KEY } from './_store.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -25,24 +26,19 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid media type' });
   }
 
-  const key = process.env.ABLY_PUBLISH_KEY;
-  if (!key) return res.status(500).json({ error: 'ABLY_PUBLISH_KEY not configured' });
+  const event = {
+    id: `${Date.now()}-${randomUUID().slice(0, 8)}`, // new id every send, so re-sending the same file replays it
+    url,
+    type,
+    filename: String(filename || '').slice(0, 200),
+    ts: Date.now(),
+  };
 
-  const r = await fetch(`https://rest.ably.io/channels/${encodeURIComponent(CHANNEL)}/messages`, {
-    method: 'POST',
-    headers: {
-      Authorization: 'Basic ' + Buffer.from(key).toString('base64'),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      name: 'new_media',
-      data: JSON.stringify({ url, type, filename: String(filename || '').slice(0, 200) }),
-    }),
-  });
-
-  if (!r.ok) {
-    const detail = await r.text();
-    return res.status(502).json({ error: 'Broadcast failed', detail });
+  try {
+    // Expire after 24h, matching the blob cleanup cron, so a stale event never points at a deleted file.
+    await redis(['SET', LATEST_KEY, JSON.stringify(event), 'EX', 86400]);
+  } catch (err) {
+    return res.status(502).json({ error: 'Broadcast failed', detail: err.message });
   }
-  return res.status(200).json({ status: 'sent', url, type, filename });
+  return res.status(200).json({ status: 'sent', url, type, filename: event.filename });
 }
