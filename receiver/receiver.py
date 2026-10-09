@@ -1,7 +1,8 @@
-"""Media Broadcast receiver (Vercel/Ably edition).
+"""Media Broadcast receiver (Vercel polling edition).
 
-Listens to an Ably channel over Server-Sent Events (plain HTTPS, no SDK),
-downloads the announced file from Vercel Blob and shows it fullscreen.
+Polls <BROADCAST_URL>/api/latest every few seconds. When a new broadcast event
+appears, downloads the announced file from Vercel Blob and shows it fullscreen.
+Plain HTTPS only: no Ably, no SDK, no long-lived connections.
 """
 import json
 import logging
@@ -10,24 +11,32 @@ import queue
 import sys
 import threading
 import time
-import tkinter as tk
 from urllib.parse import urlparse
 
-import requests
-import vlc
-from PIL import Image, ImageTk
-
 # ---------------- Configuration ----------------
-ABLY_SUBSCRIBE_KEY = os.environ.get("ABLY_SUBSCRIBE_KEY", "")  # "appId.keyId:secret" (subscribe-only key)
-ABLY_CHANNEL = os.environ.get("ABLY_CHANNEL", "media")
+BROADCAST_URL = os.environ.get("BROADCAST_URL", "").rstrip("/")  # e.g. https://your-app.vercel.app
+RECEIVER_KEY = os.environ.get("RECEIVER_KEY", "")                # same value as RECEIVER_KEY on Vercel (optional)
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "3"))
+SHOW_LAST_ON_START = os.environ.get("SHOW_LAST_ON_START", "0") == "1"  # replay the current event at startup?
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".media_broadcast_cache")
 LOG_FILE = os.path.join(CACHE_DIR, "receiver.log")
 CACHE_MAX_AGE_DAYS = 7
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Logging is configured BEFORE the other imports so that a missing VLC/Pillow shows up in the log
+# (under pythonw there is no console, so the error would otherwise be invisible).
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("receiver")
+
+try:
+    import tkinter as tk
+    import requests
+    import vlc
+    from PIL import Image, ImageTk
+except Exception:
+    log.exception("Failed to import a required module (tkinter, requests, python-vlc, pillow, or VLC itself)")
+    raise
 
 
 def prune_cache():
@@ -53,59 +62,67 @@ class Receiver:
 
         self.label = tk.Label(self.root, bg="black")
         self.video_frame = tk.Frame(self.root, bg="black")
+        self.status = tk.Label(self.root, bg="black", fg="#666666", font=("Segoe UI", 14))
+        self._status_job = None
         self.photo = None
         self.vlc_instance = vlc.Instance("--no-xlib") if sys.platform.startswith("linux") else vlc.Instance()
         self.player = self.vlc_instance.media_player_new()
         em = self.player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerEndReached,
                         lambda e: self.events.put(("video_end", None)))
-        self.download_lock = threading.Lock()
         self.latest_token = 0  # newest event wins if downloads overlap
 
     # ---------- networking (background threads) ----------
     def listen_loop(self):
-        """Subscribe to Ably over SSE; reconnect forever with backoff."""
-        if not ABLY_SUBSCRIBE_KEY or ":" not in ABLY_SUBSCRIBE_KEY:
-            log.error("ABLY_SUBSCRIBE_KEY is missing or malformed")
+        """Poll /api/latest forever; back off on errors."""
+        if not BROADCAST_URL.startswith("http"):
+            log.error("BROADCAST_URL is missing or invalid (got %r). Edit start.bat.", BROADCAST_URL)
+            self.events.put(("status", ("BROADCAST_URL is not set - edit start.bat", None)))
             return
-        key_name, key_secret = ABLY_SUBSCRIBE_KEY.split(":", 1)
-        url = "https://realtime.ably.io/event-stream"
-        delay = 2
+        url = BROADCAST_URL + "/api/latest"
+        params = {"k": RECEIVER_KEY} if RECEIVER_KEY else None
+        last_id = None
+        first_poll = True
+        connected = False
+        delay = POLL_SECONDS
+        log.info("Polling %s every %ss", url, POLL_SECONDS)
         while True:
             try:
-                with requests.get(url, params={"channels": ABLY_CHANNEL, "v": "1.2"},
-                                  auth=(key_name, key_secret), stream=True,
-                                  timeout=(10, 90)) as r:
-                    r.raise_for_status()
-                    log.info("Connected to Ably channel '%s'", ABLY_CHANNEL)
-                    delay = 2
-                    for raw in r.iter_lines(chunk_size=1, decode_unicode=True):
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", "replace")
-                        if raw and raw.startswith("data:"):
-                            self.handle_sse(raw[5:].strip())
-                          
-                log.warning("Stream ended; reconnecting")
+                r = requests.get(url, params=params, timeout=(10, 20))
+                if r.status_code == 401:
+                    raise RuntimeError("401 Unauthorized - RECEIVER_KEY does not match the one on Vercel")
+                r.raise_for_status()
+                if not connected:
+                    connected = True
+                    log.info("Connected to %s", url)
+                    self.events.put(("status", ("Ready - waiting for broadcast", 5)))
+                delay = POLL_SECONDS
+                if r.status_code == 200:
+                    data = r.json()
+                    event_id = data.get("id")
+                    if event_id and event_id != last_id:
+                        last_id = event_id
+                        if first_poll and not SHOW_LAST_ON_START:
+                            log.info("Ignoring event that already existed at startup: %s", event_id)
+                        else:
+                            log.info("Event: %s", data)
+                            self.handle_event(data)
+                first_poll = False
             except Exception as exc:
-                log.error("Connection error: %s (retry in %ss)", exc, delay)
+                log.error("Poll failed: %s (retry in %ss)", exc, delay)
+                if connected or first_poll:
+                    connected = False
+                    self.events.put(("status", (f"Cannot reach server - retrying ({exc})"[:120], None)))
+                delay = min(delay * 2, 30)
             time.sleep(delay)
-            delay = min(delay * 2, 30)
 
-    def handle_sse(self, payload):
-        try:
-            msg = json.loads(payload)
-            log.info("SSE raw: %s", payload[:300])            
-            if msg.get("name") != "new_media":
-                return
-            data = msg["data"]
-            if isinstance(data, str):
-                data = json.loads(data)
-            log.info("Event: %s", data)
-            self.latest_token += 1
-            token = self.latest_token
-            threading.Thread(target=self.download, args=(data, token), daemon=True).start()
-        except Exception as exc:
-            log.error("Bad event: %s", exc)
+    def handle_event(self, data):
+        if not isinstance(data, dict) or not data.get("url") or data.get("type") not in ("image", "video"):
+            log.error("Ignoring malformed event: %s", data)
+            return
+        self.latest_token += 1
+        token = self.latest_token
+        threading.Thread(target=self.download, args=(data, token), daemon=True).start()
 
     def download(self, data, token):
         try:
@@ -134,11 +151,26 @@ class Receiver:
                     latest_show = payload
                 elif kind == "video_end":
                     self.idle()
+                elif kind == "status":
+                    self.set_status(*payload)
         except queue.Empty:
             pass
         if latest_show:
             self.show(*latest_show)
         self.root.after(200, self.poll)
+
+    def set_status(self, text, seconds):
+        if self._status_job:
+            self.root.after_cancel(self._status_job)
+            self._status_job = None
+        self.status.configure(text=text)
+        self.status.place(relx=0.5, rely=0.5, anchor="center")
+        if seconds:
+            self._status_job = self.root.after(int(seconds * 1000), self.clear_status)
+
+    def clear_status(self):
+        self._status_job = None
+        self.status.place_forget()
 
     def idle(self):
         self.player.stop()
@@ -147,6 +179,7 @@ class Receiver:
 
     def show(self, path, media_type):
         self.idle()
+        self.clear_status()
         try:
             if media_type == "image":
                 self.show_image(path)
